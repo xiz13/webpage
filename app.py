@@ -5,8 +5,41 @@ import numpy as np
 import pydeck as pdk
 import requests
 from io import BytesIO
-from pathlib import Path
 
+# ===================== Page Config =====================
+st.set_page_config(page_title="Restaurant Rating Predictor", page_icon="🍽️", layout="wide")
+
+st.markdown("""
+<style>
+.block-container {padding-top: 2rem; padding-bottom: 2rem;}
+[data-testid="stSidebar"] {background-color: #f5f5f7;}
+</style>
+""", unsafe_allow_html=True)
+
+# ===================== Data URL =====================
+DATA_URL = "https://drive.google.com/uc?export=download&id=1iRWeGaDybybQ2eiTCyEgyXDYbH5FpFup"
+
+# ===================== Load Data =====================
+@st.cache_data(show_spinner="Downloading data...")
+def load_raw(url: str) -> pd.DataFrame:
+    r = requests.get(url, timeout=90)
+    r.raise_for_status()
+    return pd.read_csv(BytesIO(r.content))
+
+try:
+    df_raw = load_raw(DATA_URL)
+except Exception as e:
+    st.error(f"Failed to load CSV: {e}")
+    st.stop()
+
+# Optional: if you ALREADY computed predictions offline, just use them and skip training.
+# ---------- OFFLINE MODE EXAMPLE ----------
+# if {"predicted_rating", "probability"}.issubset(df_raw.columns):
+#     st.session_state["df_pred"] = df_raw  # so we can reuse the same code below
+#     st.success("Loaded precomputed predictions from CSV.")
+# -----------------------------------------
+
+# ===================== Model Training Utils =====================
 from sklearn.model_selection import GridSearchCV, KFold
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
@@ -14,102 +47,46 @@ from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import (
     RandomForestRegressor, GradientBoostingRegressor,
-    RandomForestClassifier, GradientBoostingClassifier, StackingClassifier
+    RandomForestClassifier, GradientBoostingClassifier
 )
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import mean_squared_error
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import StackingClassifier
 
-# =========================================================
-# Page config & tiny CSS
-# =========================================================
-st.set_page_config(page_title="Restaurant Rating Predictor", page_icon="🍽️", layout="wide")
-
-st.markdown("""
-<style>
-.block-container {padding-top: 2rem; padding-bottom: 2rem;}
-.stMetric {background: #ffffff20; border-radius: 0.5rem; padding: 0.75rem;}
-[data-testid="stSidebar"] {background-color: #f5f5f7;}
-</style>
-""", unsafe_allow_html=True)
-
-# =========================================================
-# 0. Data source (Google Drive direct link)
-# =========================================================
-DATA_URL = "https://drive.google.com/uc?export=download&id=1iRWeGaDybybQ2eiTCyEgyXDYbH5FpFup"
-
-# =========================================================
-# 1. Load data
-# =========================================================
-@st.cache_data(show_spinner="Downloading data from Google Drive...")
-def load_data(url: str) -> pd.DataFrame:
-    try:
-        r = requests.get(url, timeout=90)
-        r.raise_for_status()
-        df = pd.read_csv(BytesIO(r.content))
-    except Exception as e:
-        st.warning(f"Failed to download/read your data: {e}\nShowing a small demo dataset instead.")
-        df = pd.DataFrame({
-            "name": ["Demo A", "Demo B", "Demo C"],
-            "city": ["SF", "SF", "SF"],
-            "Geographic Area Name": ["ZIP 94102", "ZIP 94103", "ZIP 94104"],
-            "category": ["Asian", "Cafe", "Italian"],
-            "price": [2, 1, 3],
-            "popularity": [0.8, 0.5, 0.9],
-            "sentiment": [0.2, -0.1, 0.5],
-            "num_reviews": [120, 45, 300],
-            "google_rating": [4.6, 4.2, 4.8],
-            "mean_income": [85000, 90000, 110000],
-            "unemployment_percent": [4.5, 3.8, 2.9],
-            "poverty_percent": [10.2, 9.1, 6.7],
-            "latitude": [37.7749, 37.7849, 37.7649],
-            "longitude": [-122.4194, -122.4094, -122.4294],
-        })
-    return df
-
-df_raw = load_data(DATA_URL).copy()
-
-# =========================================================
-# 2. Preprocess + Train models (cached)
-# =========================================================
-@st.cache_resource(show_spinner="Training models (only runs once)...")
-def train_and_predict(df: pd.DataFrame) -> pd.DataFrame:
+def prepare_data(df: pd.DataFrame):
     df = df.copy()
 
-    # Postal code extraction (optional if already present)
     if "postal_code" not in df.columns and "Geographic Area Name" in df.columns:
         df["postal_code"] = df["Geographic Area Name"].astype(str).str.extract(r"(\d{5})")
 
     # Targets
     if "google_rating" not in df.columns:
-        raise ValueError("Column 'google_rating' is required for training the regression model.")
+        raise ValueError("Column 'google_rating' is required.")
     df["highly_rated"] = (df["google_rating"] > 4.5).astype(int)
 
     required = [
-        "price", "popularity", "sentiment", "num_reviews", "category", "google_rating",
-        "mean_income", "unemployment_percent", "poverty_percent", "latitude", "longitude"
+        "price","popularity","sentiment","num_reviews","category","google_rating",
+        "mean_income","unemployment_percent","poverty_percent","latitude","longitude"
     ]
     df = df.dropna(subset=[c for c in required if c in df.columns])
 
     # Bin reviews
     q1, q2 = df["num_reviews"].quantile([0.33, 0.66])
     df["reviews_bin"] = pd.cut(
-        df["num_reviews"],
-        bins=[-1, q1, q2, df["num_reviews"].max()],
-        labels=["low", "medium", "high"]
+        df["num_reviews"], bins=[-1, q1, q2, df["num_reviews"].max()],
+        labels=["low","medium","high"]
     )
 
-    # ---------- Feature sets ----------
-    # Regression
-    num_feats_reg = ["price", "popularity", "sentiment"]
-    cat_feats_reg = ["reviews_bin", "category"]
+    # Feature sets
+    num_feats_reg = ["price","popularity","sentiment"]
+    cat_feats_reg = ["reviews_bin","category"]
     X_reg = df[num_feats_reg + cat_feats_reg]
     y_reg = df["google_rating"]
 
-    # Classification
-    num_feats_clf = ["mean_income", "unemployment_percent", "poverty_percent",
-                     "price", "popularity", "sentiment"]
-    cat_feats_clf = ["reviews_bin", "category"]
+    num_feats_clf = ["mean_income","unemployment_percent","poverty_percent",
+                     "price","popularity","sentiment"]
+    cat_feats_clf = ["reviews_bin","category"]
     X_clf = df[num_feats_clf + cat_feats_clf]
     y_clf = df["highly_rated"]
 
@@ -122,168 +99,158 @@ def train_and_predict(df: pd.DataFrame) -> pd.DataFrame:
         ("cat", OneHotEncoder(handle_unknown="ignore"), cat_feats_clf)
     ])
 
-    # ---------- 3) Regression: pick best via CV ----------
+    return df, (X_reg, y_reg, prep_reg), (X_clf, y_clf, prep_clf)
+
+def train_models(df: pd.DataFrame):
+    """Train (lighter) models and return df with predictions."""
+    df, reg_pack, clf_pack = prepare_data(df)
+    X_reg, y_reg, prep_reg = reg_pack
+    X_clf, y_clf, prep_clf = clf_pack
+
+    # --- Regression: small grid to speed up ---
     models_reg = {
-        "DecisionTree": (
-            DecisionTreeRegressor(random_state=42),
-            {"reg__max_depth": [None, 5, 10], "reg__min_samples_split": [2, 5, 10]}
-        ),
         "RandomForest": (
-            RandomForestRegressor(random_state=42, n_jobs=-1),
-            {"reg__n_estimators": [200], "reg__max_depth": [None, 10, 20]}
+            RandomForestRegressor(random_state=42, n_jobs=1),
+            {"reg__n_estimators":[150], "reg__max_depth":[None, 15]}
         ),
         "GradientBoosting": (
             GradientBoostingRegressor(random_state=42),
-            {"reg__n_estimators": [200], "reg__learning_rate": [0.05, 0.1]}
+            {"reg__n_estimators":[200], "reg__learning_rate":[0.1]}
         )
     }
-
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    best_rmse = float("inf")
-    best_model_name = None
-    best_params_reg = None
+    kf = KFold(n_splits=3, shuffle=True, random_state=42)
+    best_rmse = 1e9
+    best_name, best_params = None, None
 
     for name, (est, params) in models_reg.items():
-        pipe = Pipeline([("preproc", prep_reg), ("reg", est)])
-        gs = GridSearchCV(pipe, params, cv=kf, scoring="neg_mean_squared_error", n_jobs=-1)
+        pipe = Pipeline([("prep", prep_reg), ("reg", est)])
+        gs = GridSearchCV(pipe, params, cv=kf, scoring="neg_mean_squared_error", n_jobs=1)
         gs.fit(X_reg, y_reg)
         mse = mean_squared_error(y_reg, gs.predict(X_reg))
         rmse = mse ** 0.5
         if rmse < best_rmse:
-            best_rmse = rmse
-            best_model_name = name
-            best_params_reg = gs.best_params_
+            best_rmse, best_name, best_params = rmse, name, gs.best_params_
 
-    # Fit final regressor
-    best_regressor = models_reg[best_model_name][0]
-    best_reg_pipe = Pipeline([("preproc", prep_reg), ("reg", best_regressor)])
-    best_reg_pipe.set_params(**best_params_reg)
-    best_reg_pipe.fit(X_reg, y_reg)
+    reg_model = models_reg[best_name][0]
+    reg_pipe = Pipeline([("prep", prep_reg), ("reg", reg_model)])
+    reg_pipe.set_params(**best_params)
+    reg_pipe.fit(X_reg, y_reg)
 
-    # ---------- 4) Classification stacking ----------
-    rf_pipe = Pipeline([
-        ("preproc", prep_clf),
-        ("clf", RandomForestClassifier(random_state=42, class_weight="balanced"))
-    ])
+    # --- Classification: no stacking to save time ---
     gb_pipe = Pipeline([
-        ("preproc", prep_clf),
+        ("prep", prep_clf),
         ("clf", GradientBoostingClassifier(random_state=42))
     ])
+    gb_pipe.fit(X_clf, y_clf)
 
-    cal_rf = CalibratedClassifierCV(rf_pipe, cv=5, method="sigmoid"); cal_rf.fit(X_clf, y_clf)
-    cal_gb = CalibratedClassifierCV(gb_pipe, cv=5, method="sigmoid"); cal_gb.fit(X_clf, y_clf)
+    df["predicted_rating"] = reg_pipe.predict(X_reg).round(1)
+    df["probability"] = gb_pipe.predict_proba(X_clf)[:,1]
 
-    stack = StackingClassifier(
-        estimators=[("rf", cal_rf), ("gb", cal_gb)],
-        final_estimator=LogisticRegression(max_iter=1000),
-        cv=5, stack_method="predict_proba"
-    )
+    return df, best_rmse, best_name
 
-    param_grid_clf = {
-        "final_estimator__C": [0.01, 0.1, 1, 10],
-        "final_estimator__class_weight": [None, "balanced"]
-    }
-    gs_clf = GridSearchCV(stack, param_grid_clf, scoring="precision", cv=5, n_jobs=-1)
-    gs_clf.fit(X_clf, y_clf)
-    best_clf = gs_clf.best_estimator_
-    best_clf.fit(X_clf, y_clf)
+# ===================== Sidebar =====================
+st.sidebar.title("Controls")
 
-    # ---------- 5) Predictions ----------
-    df["predicted_rating"] = best_reg_pipe.predict(X_reg).round(1)
-    df["probability"] = best_clf.predict_proba(X_clf)[:, 1]
-
-    # Return full df with preds
-    return df, best_rmse, best_model_name
-
-df, reg_rmse, reg_name = train_and_predict(df_raw)
-
-# Choose rating column to display
-actual_rating_col = "google_rating" if "google_rating" in df.columns else None
-
-# =========================================================
-# 3. Sidebar filters
-# =========================================================
-st.sidebar.title("Filters")
-
-# Toggle which rating to color by
-use_pred = st.sidebar.radio("Color points by", ["Predicted rating", "Actual rating" if actual_rating_col else "Predicted rating only"]) == "Predicted rating"
-
-# Category
-if "category" in df.columns:
-    cat_options = sorted(df["category"].dropna().astype(str).unique())
-    selected_categories = st.sidebar.multiselect("Category", cat_options)
+# Train button (only if not trained yet)
+if "df_pred" not in st.session_state:
+    if st.sidebar.button("🚀 Train models now"):
+        with st.spinner("Training models... (first time only)"):
+            try:
+                pred_df, rmse, model_name = train_models(df_raw)
+                st.session_state["df_pred"] = pred_df
+                st.session_state["rmse"] = rmse
+                st.session_state["model_name"] = model_name
+                st.success("Training finished.")
+            except Exception as e:
+                st.error(f"Training failed: {e}")
 else:
-    selected_categories = []
+    st.sidebar.write("Models already trained (cached).")
+    if st.sidebar.button("🔁 Retrain (clear cache)"):
+        for k in ["df_pred", "rmse", "model_name"]:
+            st.session_state.pop(k, None)
+        st.experimental_rerun()
 
-# Price
+# Use predicted or actual rating for color
+color_choice = st.sidebar.radio("Color points by", ["Predicted rating", "Actual rating"])
+prob_threshold = st.sidebar.slider("Min probability", 0.0, 1.0, 0.0, 0.01)
+
+# ===================== Decide which DF to show =====================
+if "df_pred" in st.session_state:
+    df = st.session_state["df_pred"]
+    rmse = st.session_state["rmse"]
+    model_name = st.session_state["model_name"]
+else:
+    # No model yet -> just use raw df (no preds)
+    df = df_raw.copy()
+    rmse = None
+    model_name = None
+    if "predicted_rating" not in df.columns:
+        df["predicted_rating"] = np.nan
+    if "probability" not in df.columns:
+        df["probability"] = 0.0
+
+# ===================== Filters =====================
+if "category" in df.columns:
+    cats = sorted(df["category"].dropna().astype(str).unique())
+    selected_cats = st.sidebar.multiselect("Category filter", cats)
+else:
+    selected_cats = []
+
 if "price" in df.columns and pd.api.types.is_numeric_dtype(df["price"]):
     pmin, pmax = int(df["price"].min()), int(df["price"].max())
     price_range = st.sidebar.slider("Price range", pmin, pmax, (pmin, pmax))
 else:
     price_range = None
 
-# Probability threshold
-prob_threshold = st.sidebar.slider("Min probability (highly rated)", 0.0, 1.0, 0.0, 0.01)
-
-# Build mask
 mask = pd.Series(True, index=df.index)
-if selected_categories and "category" in df.columns:
-    mask &= df["category"].astype(str).isin(selected_categories)
+if selected_cats and "category" in df.columns:
+    mask &= df["category"].astype(str).isin(selected_cats)
 if price_range and "price" in df.columns:
     mask &= df["price"].between(*price_range)
-mask &= df["probability"] >= prob_threshold
+if "probability" in df.columns:
+    mask &= df["probability"] >= prob_threshold
 
 show_df = df.loc[mask].copy()
 
-# =========================================================
-# 4. KPIs
-# =========================================================
+# ===================== KPIs =====================
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Records", len(show_df))
-if actual_rating_col:
-    col2.metric("Avg. Actual Rating", f"{show_df[actual_rating_col].mean():.2f}")
+if "google_rating" in show_df.columns and pd.api.types.is_numeric_dtype(show_df["google_rating"]):
+    col2.metric("Avg actual rating", f"{show_df['google_rating'].mean():.2f}")
 else:
-    col2.metric("Avg. Actual Rating", "N/A")
-col3.metric("Avg. Predicted Rating", f"{show_df['predicted_rating'].mean():.2f}")
-col4.metric("Avg. Probability", f"{show_df['probability'].mean():.2f}")
+    col2.metric("Avg actual rating", "N/A")
+col3.metric("Avg predicted rating", f"{show_df['predicted_rating'].mean():.2f}")
+col4.metric("Avg probability", f"{show_df['probability'].mean():.2f}")
 
-st.caption(f"Best regressor: **{reg_name}**, RMSE on full data (approx): **{reg_rmse:.3f}**")
+if rmse is not None:
+    st.caption(f"Regressor: **{model_name}**, RMSE ≈ **{rmse:.3f}** (on full data).")
 
-# =========================================================
-# 5. Map
-# =========================================================
+# ===================== Map =====================
 st.subheader("Interactive Map")
 
-if {"latitude", "longitude"}.issubset(show_df.columns):
-    # color by rating metric
-    color_source = show_df["predicted_rating"] if use_pred or not actual_rating_col else show_df[actual_rating_col]
+if {"latitude","longitude"}.issubset(show_df.columns):
+    color_source = show_df["predicted_rating"] if color_choice == "Predicted rating" else show_df.get("google_rating", show_df["predicted_rating"])
     rmin, rmax = color_source.min(), color_source.max()
 
-    def rating_to_rgb(r):
+    def rating_to_rgba(r):
         if pd.isna(r) or rmax == rmin:
-            return [180, 180, 180, 170]
-        t = (r - rmin) / (rmax - rmin)  # 0~1
-        # blue -> green -> red gradient
-        return [
-            int(255 * (1 - t)),      # R
-            int(100 + 155 * t),      # G
-            int(200 * (1 - t)),      # B
-            180
-        ]
+            return [180,180,180,170]
+        t = (r - rmin) / (rmax - rmin)
+        return [int(255*(1-t)), int(120+135*t), int(200*(1-t)), 180]
 
-    show_df["color"] = color_source.apply(rating_to_rgb)
+    show_df["color"] = color_source.apply(rating_to_rgba)
 
-    initial_view = pdk.ViewState(
+    view = pdk.ViewState(
         latitude=float(show_df["latitude"].mean()),
         longitude=float(show_df["longitude"].mean()),
         zoom=11
     )
 
-    tooltip_text = "{name}\\nPred: {predicted_rating}\\nProb: {probability}"
-    if actual_rating_col:
-        tooltip_text += f"\\nActual: {{{actual_rating_col}}}"
+    tooltip = "{name}\\nPred: {predicted_rating}\\nProb: {probability:.2f}"
+    if "google_rating" in show_df.columns:
+        tooltip += "\\nActual: {google_rating}"
     if "category" in show_df.columns:
-        tooltip_text += "\\nCat: {category}"
+        tooltip += "\\nCat: {category}"
 
     scatter = pdk.Layer(
         "ScatterplotLayer",
@@ -291,7 +258,7 @@ if {"latitude", "longitude"}.issubset(show_df.columns):
         get_position='[longitude, latitude]',
         get_radius=60,
         get_fill_color="color",
-        pickable=True,
+        pickable=True
     )
 
     show_density = st.toggle("Show density (HexagonLayer)", value=False)
@@ -310,37 +277,27 @@ if {"latitude", "longitude"}.issubset(show_df.columns):
         )
         layers.insert(0, hex_layer)
 
-    deck = pdk.Deck(initial_view_state=initial_view, layers=layers, tooltip={"text": tooltip_text})
-    st.pydeck_chart(deck)
+    st.pydeck_chart(pdk.Deck(initial_view_state=view, layers=layers, tooltip={"text": tooltip}))
 else:
-    st.error("Missing 'latitude' and 'longitude' columns.")
+    st.error("No latitude/longitude columns.")
 
-# =========================================================
-# 6. Table & Download
-# =========================================================
+# ===================== Table & Download =====================
 with st.expander("Show data table"):
     st.dataframe(show_df, use_container_width=True)
 
-csv_bytes = show_df.to_csv(index=False).encode("utf-8")
 st.download_button(
-    "Download filtered data (CSV)",
-    data=csv_bytes,
-    file_name="predictions_filtered.csv",
+    "Download filtered CSV",
+    data=show_df.to_csv(index=False).encode("utf-8"),
+    file_name="filtered_predictions.csv",
     mime="text/csv"
 )
 
-# =========================================================
-# 7. About
-# =========================================================
-with st.expander("About this app"):
+# ===================== About =====================
+with st.expander("About"):
     st.markdown("""
-**Restaurant Rating Predictor**
+**How this app works**
 
-- Loads your dataset from Google Drive on each run (cached during session).
-- Trains:
-  - A regression model (best of DT / RF / GB) to predict Google rating.
-  - A stacking classifier (RF + GB → LogisticRegression) to estimate probability of being "highly rated" (>4.5).
-- Interactive filters and beautiful map (pydeck Scatterplot + optional HexagonLayer).
-
-_You can cache models to avoid re-training every rerun. Here it's done via `@st.cache_resource`._
+- Data is pulled from Google Drive each run and cached.
+- Heavy model training is run **only when you click the button** (cached afterwards).
+- You can precompute predictions offline and skip in-app training for faster startup.
 """)
