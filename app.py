@@ -43,7 +43,7 @@ if SAFE_START and "df_raw" not in st.session_state:
     if st.button("Load data"):
         with st.spinner("Loading..."):
             st.session_state["df_raw"] = load_raw(DATA_URL)
-        st.experimental_rerun()
+        st.rerun()
     st.stop()
 
 # Data is ready here
